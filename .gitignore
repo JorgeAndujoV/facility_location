@@ -1,10 +1,11 @@
 .venv/
 __pycache__/
 .ipynb_checkpoints/
-
-# Local outputs
 outputs/
-
-# OS/editor
 .DS_Store
 Thumbs.db
+.claude/
+METHODOLOGY_REVIEW.txt
+notebookRevision.txt
+reports/
+

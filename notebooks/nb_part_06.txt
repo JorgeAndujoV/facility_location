@@ -1,0 +1,217 @@
+
+    covered_df = assign_df[assign_df['uncovered'] == 0].copy()
+    covered = int(len(covered_df))
+    n_demands = int(len(assign_df))
+    pct_covered = (covered / n_demands) if n_demands > 0 else np.nan
+
+    if covered > 0:
+        mean_dist = float(covered_df['dist_m'].mean())
+        wsum = float(covered_df['w_i'].sum())
+        w_mean_dist = float((covered_df['dist_m'] * covered_df['w_i']).sum() / wsum) if wsum > 0 else np.nan
+    else:
+        mean_dist = np.nan
+        w_mean_dist = np.nan
+
+    metrics = {
+        'cluster': int(cluster_id),
+        'opened': int(len(open_df)),
+        'n_demands': int(n_demands),
+        'covered': int(covered),
+        'pct_covered': float(pct_covered) if pd.notna(pct_covered) else np.nan,
+        'mean_dist_m': float(mean_dist) if pd.notna(mean_dist) else np.nan,
+        'w_mean_dist_m': float(w_mean_dist) if pd.notna(w_mean_dist) else np.nan,
+        'objective_value': float(pulp.value(model.objective)) if pulp.value(model.objective) is not None else np.nan,
+    }
+
+    return assign_df, open_df, metrics, status
+
+
+================================================================================
+CELL 46 (CODE)
+================================================================================
+
+# Run clustered optimization and export per-cluster/global tables
+clusters_to_solve = sorted(df_I['cluster_i'].dropna().astype(int).unique().tolist())
+print('Clusters to solve:', clusters_to_solve)
+
+j_to_p_map = dict(df_J[['j', 'p']].astype(int).itertuples(index=False, name=None)) if len(df_J) > 0 else {}
+
+all_assign = []
+all_open = []
+metrics_rows = []
+status_rows = []
+
+for c in clusters_to_solve:
+    print(f'\nSolving cluster {c} ...')
+    assign_c, open_c, metrics_c, status_c = solve_cluster_model(
+        cluster_id=int(c),
+        df_I=df_I,
+        df_J=df_J,
+        df_P=df_P,
+        df_A=df_A,
+        df_conflictos=df_conflictos,
+        j_to_p_map=j_to_p_map,
+        p_new_per_cluster=P_NEW_PER_CLUSTER,
+        penalty_uncovered=PENALTY_UNCOVERED,
+        time_limit_sec=TIME_LIMIT_SEC,
+        solver_msg=False,
+    )
+
+    status_rows.append({'cluster': int(c), 'solver_status': status_c})
+
+    assign_path = RESULTS_DIR / f'asignaciones_cluster{int(c)}.csv'
+    open_path = RESULTS_DIR / f'aperturas_cluster{int(c)}.csv'
+
+    assign_c.to_csv(assign_path, index=False)
+    open_c.to_csv(open_path, index=False)
+
+    print(f"  status={status_c} | opened={metrics_c['opened']} | covered={metrics_c['covered']}/{metrics_c['n_demands']}")
+
+    all_assign.append(assign_c)
+    all_open.append(open_c)
+    metrics_rows.append(metrics_c)
+
+asignaciones_global = pd.concat(all_assign, ignore_index=True) if all_assign else pd.DataFrame(columns=['i','p','dist_m','uncovered','cluster_solved','lat_i','lon_i','cluster_i','w_i','lat_p','lon_p','cluster_p'])
+aperturas_global = pd.concat(all_open, ignore_index=True) if all_open else pd.DataFrame(columns=['id','lat','lon','cluster','opened','cluster_solved'])
+metrics_por_cluster = pd.DataFrame(metrics_rows).sort_values('cluster').reset_index(drop=True)
+status_por_cluster = pd.DataFrame(status_rows).sort_values('cluster').reset_index(drop=True)
+
+covered_global = asignaciones_global[asignaciones_global['uncovered'] == 0].copy()
+n_demands_total = int(len(asignaciones_global))
+covered_total = int(len(covered_global))
+
+if covered_total > 0:
+    mean_dist_total = float(covered_global['dist_m'].mean())
+    wsum_total = float(covered_global['w_i'].sum())
+    w_mean_dist_total = float((covered_global['dist_m'] * covered_global['w_i']).sum() / wsum_total) if wsum_total > 0 else np.nan
+else:
+    mean_dist_total = np.nan
+    w_mean_dist_total = np.nan
+
+metrics_global = pd.DataFrame([
+    {
+        'opened_total': int(len(aperturas_global)),
+        'n_demands_total': int(n_demands_total),
+        'covered_total': int(covered_total),
+        'pct_covered_total': float(covered_total / n_demands_total) if n_demands_total > 0 else np.nan,
+        'mean_dist_m_total': mean_dist_total,
+        'w_mean_dist_m_total': w_mean_dist_total,
+    }
+])
+
+asignaciones_global.to_csv(RESULTS_DIR / 'asignaciones_global.csv', index=False)
+aperturas_global.to_csv(RESULTS_DIR / 'aperturas_global.csv', index=False)
+metrics_por_cluster.to_csv(RESULTS_DIR / 'metrics_por_cluster.csv', index=False)
+metrics_global.to_csv(RESULTS_DIR / 'metrics_global.csv', index=False)
+status_por_cluster.to_csv(RESULTS_DIR / 'solver_status_por_cluster.csv', index=False)
+
+print('\nSaved global results in', RESULTS_DIR)
+print('metrics_global:')
+print(metrics_global)
+print('solver statuses:')
+print(status_por_cluster)
+
+
+================================================================================
+CELL 47 (MARKDOWN)
+================================================================================
+visualizations
+
+================================================================================
+CELL 48 (CODE)
+================================================================================
+
+# Plot: nuevas aperturas + tiendas actuales
+CSV_BASE = PROCESSED_DIR / 'condensado.csv'
+CSV_OPEN = RESULTS_DIR / 'aperturas_global.csv'
+OUT_PNG = FIG_DIR / 'mapa_aperturas_global.png'
+
+df_base = pd.read_csv(CSV_BASE)
+opens = pd.read_csv(CSV_OPEN)
+
+gdf_base_pts = gpd.GeoDataFrame(
+    df_base.copy(),
+    geometry=gpd.points_from_xy(df_base['lon'], df_base['lat']),
+    crs='EPSG:4326',
+)
+
+gdf_ox = gdf_base_pts.loc[gdf_base_pts['oxxo_presente'] == 1, ['oxxo_presente', 'geometry']].copy()
+
+if len(opens) > 0:
+    gdf_open = gpd.GeoDataFrame(
+        opens.copy(),
+        geometry=gpd.points_from_xy(opens['lon'], opens['lat']),
+        crs='EPSG:4326',
+    )
+else:
+    gdf_open = gpd.GeoDataFrame(columns=['geometry'], geometry='geometry', crs='EPSG:4326')
+
+fig, ax = plt.subplots(figsize=(10, 10))
+
+gdf_base_pts.plot(
+    ax=ax,
+    column='oxxo_presente' if 'oxxo_presente' in gdf_base_pts.columns else None,
+    categorical='oxxo_presente' in gdf_base_pts.columns,
+    legend='oxxo_presente' in gdf_base_pts.columns,
+    markersize=6,
+    alpha=0.55,
+)
+
+if len(gdf_ox) > 0:
+    gdf_ox.plot(ax=ax, color='k', marker='*', markersize=45, alpha=0.9, label='Tiendas actuales')
+
+if len(gdf_open) > 0:
+    gdf_open.plot(ax=ax, color='tab:red', marker='o', markersize=28, alpha=0.9, label='Nuevas aperturas')
+
+ax.set_title('Nuevas aperturas y tiendas actuales', fontsize=13)
+ax.set_axis_off()
+ax.legend(loc='lower right')
+
+plt.tight_layout()
+plt.savefig(OUT_PNG, dpi=150, bbox_inches='tight')
+plt.show()
+print('Figura guardada en:', OUT_PNG)
+
+
+================================================================================
+CELL 49 (CODE)
+================================================================================
+
+# Benchmark: cobertura por cluster (no ponderado y ponderado por demanda)
+METRICS = RESULTS_DIR / 'metrics_por_cluster.csv'
+ASIG = RESULTS_DIR / 'asignaciones_global.csv'
+
+m = pd.read_csv(METRICS).sort_values('cluster')
+a = pd.read_csv(ASIG)
+
+g = (
+    a.groupby('cluster_i')
+    .apply(lambda g: g.loc[g['uncovered'] == 0, 'w_i'].sum() / max(g['w_i'].sum(), 1e-9))
+    .rename('pct_cov_weighted')
+    .reset_index()
+)
+
+df_plot_cov = (
+    m[['cluster', 'pct_covered']]
+    .merge(g.rename(columns={'cluster_i': 'cluster'}), on='cluster', how='left')
+)
+
+x = df_plot_cov['cluster'].astype(int)
+w = 0.4
+fig, ax = plt.subplots(figsize=(10, 5))
+
+ax.bar(x - w / 2, 100 * df_plot_cov['pct_covered'], width=w, label='% nodos cubiertos')
+ax.bar(x + w / 2, 100 * df_plot_cov['pct_cov_weighted'], width=w, label='% demanda cubierta')
+
+ax.set_xticks(x)
+ax.set_xlabel('Cluster')
+ax.set_ylabel('Cobertura (%)')
+ax.set_title('Cobertura por cluster')
+ax.legend()
+ax.grid(axis='y', linestyle=':', alpha=0.5)
+
+plt.tight_layout()
+out = FIG_DIR / 'benchmark_cobertura_por_cluster.png'
+plt.savefig(out, dpi=150, bbox_inches='tight')
+plt.show()
+print('Figura guardada en:', out)

@@ -1,0 +1,300 @@
+================================================================================
+import prince
+
+cols_mca = [
+    'POB0_14_P', 'P15A29A_P', 'P30A59A_P',
+    'P_60YMAS_P', 'P_CD_P', 'GRAPROES',
+    'VIVPAR_P', 'TVIPAHAB', 'TVIPAHAB_P',
+    'VIVNOHAB_P', 'PRO_OCUP_C',
+    'V3MASOCU_P', 'VPH_PIDT_P', 'VPH_C_EL_P',
+    'VPH_EXSA_P', 'VPH_DREN_P', 'RECUCALL_C',
+    'RAMPAS_C', 'PASOPEAT_C', 'BANQUETA_C', 'GUARNICI_C', 'CICLOVIA_C',
+    'CICLOCAR_C', 'ALUMPUB_C', 'LETRERO_C', 'TELPUB_C', 'ARBOLES_C',
+    'DRENAJEP_C', 'TRANSCOL_C', 'ACESOPER_C', 'ACESOAUT_C', 'PUESSEMI_C',
+    'PUESAMBU_C'
+]
+
+missing_cols = [c for c in cols_mca if c not in manzanas_completas.columns]
+if missing_cols:
+    raise ValueError(f'Missing columns for MCA: {missing_cols}')
+
+X_mca_base = manzanas_completas[cols_mca].copy()
+print('X_mca_base shape:', X_mca_base.shape)
+X_mca_base.head(3)
+
+================================================================================
+CELL 25 (CODE)
+================================================================================
+# Intermediate check: missingness and cardinality before categorization
+summary_mca = pd.DataFrame({
+    'missing_pct': X_mca_base.isna().mean() * 100,
+    'n_unique': X_mca_base.nunique(dropna=True)
+}).sort_values(['missing_pct', 'n_unique'], ascending=[False, False])
+summary_mca.head(15)
+
+================================================================================
+CELL 26 (CODE)
+================================================================================
+def to_mca_category(series: pd.Series, q: int = 5) -> pd.Series:
+    x = pd.to_numeric(series, errors='coerce')
+
+    miss = x.isna()
+    n_unique = x.nunique(dropna=True)
+
+    if n_unique == 0:
+        out = pd.Series('MISSING', index=series.index, dtype='object')
+        return out
+
+    if n_unique <= q:
+        out = x.round(6).astype('string')
+        out[miss] = 'MISSING'
+        return out.astype('category')
+
+    try:
+        binned = pd.qcut(x, q=q, duplicates='drop')
+        out = binned.astype('string')
+    except Exception:
+        binned = pd.cut(x, bins=min(q, max(2, n_unique)), duplicates='drop')
+        out = binned.astype('string')
+
+    out[miss] = 'MISSING'
+    return out.astype('category')
+
+X_mca_cat = pd.DataFrame({c: to_mca_category(X_mca_base[c], q=5) for c in cols_mca})
+
+print('Categorized matrix shape:', X_mca_cat.shape)
+print('Example categories counts (first 5 vars):')
+for c in cols_mca[:5]:
+    print(c, '->', X_mca_cat[c].nunique())
+
+# Prince compatibility: explicitly build dense numeric one-hot matrix
+# to avoid sparse/object dtype issues across scipy/pandas versions.
+X_mca_ready = pd.get_dummies(X_mca_cat.astype(str), drop_first=False, dtype=float)
+print('One-hot MCA matrix shape:', X_mca_ready.shape)
+print('One-hot dtypes unique:', pd.Series(X_mca_ready.dtypes.astype(str)).value_counts().to_dict())
+
+X_mca_cat.head(3)
+
+
+================================================================================
+CELL 27 (CODE)
+================================================================================
+# Fit MCA
+n_components_mca = 7
+mca = prince.MCA(
+    n_components=n_components_mca,
+    n_iter=10,
+    copy=True,
+    check_input=True,
+    one_hot=False,
+    random_state=42
+)
+
+Z_mca = mca.fit_transform(X_mca_ready)
+Z_mca.columns = [f'MCA{i+1}' for i in range(Z_mca.shape[1])]
+
+print('MCA scores shape:', Z_mca.shape)
+Z_mca.head(3)
+
+
+================================================================================
+CELL 28 (CODE)
+================================================================================
+# Extract explained inertia / variance-style summary (version-robust)
+if hasattr(mca, 'percentage_of_variance_') and mca.percentage_of_variance_ is not None:
+    explained = np.array(mca.percentage_of_variance_, dtype=float)
+    if explained.max() > 1.0:
+        explained = explained / 100.0
+elif hasattr(mca, 'eigenvalues_') and mca.eigenvalues_ is not None:
+    ev = np.array(mca.eigenvalues_, dtype=float)
+    explained = ev / ev.sum() if ev.sum() > 0 else ev
+else:
+    explained = np.repeat(np.nan, Z_mca.shape[1])
+
+cum_explained = np.nancumsum(explained)
+
+print('Explained (first components):')
+print(np.round(explained, 4))
+print('Cumulative explained:')
+print(np.round(cum_explained, 4))
+
+# ── Greenacre correction ────────────────────────────────────────────────────
+# Raw MCA inertia is inflated by the number of categories (total_inertia = K/Q - 1).
+# The Benzecri/Greenacre correction produces percentages comparable to PCA.
+_ev_raw = np.array(mca.eigenvalues_, dtype=float) if hasattr(mca, 'eigenvalues_') else np.array([])
+if len(_ev_raw) > 0:
+    _Q = len(cols_mca)            # number of original variables after removing absolutes
+    _ev_corr = (((_Q / (_Q - 1)) * (_ev_raw - 1.0 / _Q)) ** 2)
+    _ev_corr[_ev_raw < 1.0 / _Q] = 0.0
+    _total_corr = _ev_corr.sum()
+    gc_explained = _ev_corr / _total_corr if _total_corr > 0 else np.zeros_like(_ev_corr)
+    print('Greenacre-corrected explained inertia (first components):')
+    print(np.round(gc_explained, 4))
+    print('Greenacre cumulative:')
+    print(np.round(np.cumsum(gc_explained), 4))
+else:
+    print('eigenvalues_ not available; skipping Greenacre correction')
+
+================================================================================
+CELL 29 (CODE)
+================================================================================
+# Decision-style plots for MCA components (analogous to PCA diagnostics)
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+axes[0].plot(np.arange(1, len(explained) + 1), explained, marker='o')
+axes[0].set_title('MCA explained contribution by component')
+axes[0].set_xlabel('Component')
+axes[0].set_ylabel('Explained ratio')
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(np.arange(1, len(cum_explained) + 1), cum_explained, marker='o')
+axes[1].set_title('MCA cumulative explained ratio')
+axes[1].set_xlabel('Component')
+axes[1].set_ylabel('Cumulative explained ratio')
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+out_path = FIG_DIR / 'mca_explained_components.png'
+plt.savefig(out_path, dpi=150, bbox_inches='tight')
+plt.show()
+print('Figure saved to:', out_path)
+
+================================================================================
+CELL 30 (CODE)
+================================================================================
+# Intermediate interpretation: top contributing variables to MCA1
+# Prince returns contributions by one-hot levels; aggregate by original variable prefix.
+col_contrib = mca.column_contributions_.copy()
+col_contrib.columns = [f'MCA{i+1}' for i in range(col_contrib.shape[1])]
+
+var_prefixes = sorted(cols_mca, key=len, reverse=True)
+
+def original_var(level_name: str) -> str:
+    s = str(level_name)
+    for v in var_prefixes:
+        if s.startswith(v):
+            return v
+    return s.split('_')[0]
+
+col_contrib['variable'] = [original_var(ix) for ix in col_contrib.index]
+var_contrib = col_contrib.groupby('variable').sum(numeric_only=True).sort_values('MCA1', ascending=False)
+
+var_contrib.head(15)
+
+================================================================================
+CELL 31 (CODE)
+================================================================================
+# MCA category biplot — key interpretive plot
+# Shows which category labels (variable levels) pull each axis.
+# Positive MCA1 = the dominant socio-urban "direction" of that pole.
+
+if hasattr(mca, 'column_coordinates_') and mca.column_coordinates_ is not None:
+    _col_coords = mca.column_coordinates_.copy()
+else:
+    try:
+        _col_coords = mca.column_coordinates(X_mca_ready).copy()
+    except Exception as _e:
+        raise AttributeError(f'Cannot retrieve column coordinates from MCA object: {_e}')
+
+_col_coords.columns = [f'MCA{i+1}' for i in range(_col_coords.shape[1])]
+_col_coords['variable'] = [original_var(ix) for ix in _col_coords.index]
+
+# Restrict to top-12 contributing variables for readability
+_top_vars_bp = var_contrib.head(12).index.tolist()
+_coords_top = _col_coords[_col_coords['variable'].isin(_top_vars_bp)].copy()
+
+_unique_vars = _coords_top['variable'].unique()
+_cmap_bp = plt.cm.get_cmap('tab20', len(_unique_vars))
+_color_map = {v: _cmap_bp(k) for k, v in enumerate(_unique_vars)}
+
+fig, ax = plt.subplots(figsize=(13, 9))
+for _var, _grp in _coords_top.groupby('variable'):
+    ax.scatter(_grp['MCA1'], _grp['MCA2'], s=45, alpha=0.85,
+               color=_color_map[_var], label=_var, zorder=3)
+    for _lbl, _row in _grp.iterrows():
+        _txt = str(_lbl)[-24:] if len(str(_lbl)) > 24 else str(_lbl)
+        ax.annotate(_txt, (_row['MCA1'], _row['MCA2']),
+                    fontsize=6, alpha=0.6,
+                    xytext=(3, 3), textcoords='offset points')
+
+ax.axhline(0, color='k', linewidth=0.7, linestyle='--', alpha=0.4)
+ax.axvline(0, color='k', linewidth=0.7, linestyle='--', alpha=0.4)
+ax.set_xlabel('MCA1', fontsize=11)
+ax.set_ylabel('MCA2', fontsize=11)
+ax.set_title('MCA category biplot — top-12 contributing variables', fontsize=12)
+ax.legend(loc='upper right', fontsize=7, ncol=2, framealpha=0.7, title='Variable')
+plt.tight_layout()
+_bp_path = FIG_DIR / 'mca_category_biplot.png'
+plt.savefig(_bp_path, dpi=150, bbox_inches='tight')
+plt.show()
+print('Biplot saved to:', _bp_path)
+print()
+print('Reading the biplot:')
+print('  Categories toward +MCA1 characterize HIGH-MCA1 neighborhoods.')
+print('  Categories toward -MCA1 characterize LOW-MCA1 neighborhoods.')
+print('  After sign correction (next cell), +MCA1 should = better urban conditions.')
+
+================================================================================
+CELL 32 (CODE)
+================================================================================
+# Expose MCA dimensions clearly for downstream model code
+manzanas_completas = manzanas_completas.copy()
+for i in range(Z_mca.shape[1]):
+    manzanas_completas[f'MCA{i+1}'] = Z_mca.iloc[:, i].values
+
+# Main score used in this pipeline
+manzanas_completas['MCA1'] = Z_mca.iloc[:, 0].values
+
+# Optional legacy aliases (not used by default anymore)
+manzanas_completas['PC1'] = manzanas_completas['MCA1']
+if 'MCA2' in manzanas_completas.columns:
+    manzanas_completas['PC2'] = manzanas_completas['MCA2']
+if 'MCA3' in manzanas_completas.columns:
+    manzanas_completas['PC3'] = manzanas_completas['MCA3']
+
+manzanas_completas[['MCA1']].describe()
+
+# ── MCA1 sign verification ───────────────────────────────────────────────────
+# The SVD sign is arbitrary.  Confirm: higher GRAPROES (education) → higher MCA1.
+_edu_q = pd.qcut(manzanas_completas['GRAPROES'], q=5, labels=False, duplicates='drop')
+_mean_mca1_edu = manzanas_completas.groupby(_edu_q)['MCA1'].mean()
+print('Mean MCA1 by GRAPROES quintile (0 = lowest education, 4 = highest):')
+print(_mean_mca1_edu.round(4))
+
+if _mean_mca1_edu.iloc[-1] < _mean_mca1_edu.iloc[0]:
+    print('>> Sign flipped: inverting all MCA axes so +MCA1 = better conditions.')
+    for _col in [c for c in manzanas_completas.columns if c.startswith('MCA')]:
+        manzanas_completas[_col] = -manzanas_completas[_col]
+    manzanas_completas['PC1'] = manzanas_completas['MCA1']
+    Z_mca = Z_mca * -1
+else:
+    print('>> Sign OK: +MCA1 already corresponds to higher-education neighborhoods.')
+
+# ── Normalize MCA1 to [0, 1] for use as demand weight ───────────────────────
+# Raw MCA1 can be negative; normalization guarantees non-negative demand weights.
+_m1 = manzanas_completas['MCA1']
+_mca1_min, _mca1_max = _m1.min(), _m1.max()
+manzanas_completas['MCA1_weight'] = (_m1 - _mca1_min) / (_mca1_max - _mca1_min)
+print(f'\nMCA1_weight in [{manzanas_completas["MCA1_weight"].min():.4f}, '
+      f'{manzanas_completas["MCA1_weight"].max():.4f}]')
+
+manzanas_completas[['MCA1', 'MCA1_weight']].describe()
+
+================================================================================
+CELL 33 (CODE)
+================================================================================
+# Distribution plot for MCA1
+plt.figure(figsize=(8, 4))
+plt.hist(manzanas_completas['MCA1'].dropna(), bins=40)
+plt.title('MCA1 distribution')
+plt.xlabel('MCA1 score')
+plt.ylabel('Frequency')
+plt.tight_layout()
+out_path = FIG_DIR / 'mca1_histogram.png'
+plt.savefig(out_path, dpi=150, bbox_inches='tight')
+plt.show()
+print('Figure saved to:', out_path)
+
+================================================================================
+CELL 34 (CODE)
+================================================================================
